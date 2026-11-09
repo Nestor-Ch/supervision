@@ -1,0 +1,214 @@
+body {
+  background-color: #eaf2fb !important;
+}
+
+.card {
+  border: none;
+  box-shadow: none;
+}
+
+.card:not(.valuebox) {
+  background: transparent;
+}
+
+.card-header {
+  background: transparent;
+  border-bottom: none;
+  font-weight: 600;
+}
+
+.leaflet-container {
+  background-color: #eaf2fb !important;
+}
+
+/* DT::formatStyle() only ever styles body <td> cells, never the header
+   row - the header needs its own CSS rule to match. */
+table.dataTable thead th {
+  font-size: 10px;
+}
+
+/* Thin, theme-colored scrollbars for scrollable card/table areas, instead
+   of the browser's stark default system scrollbar - makes tables that
+   overflow their card look like part of the page rather than a foreign
+   embedded widget. */
+.card-body,
+div.dataTables_wrapper,
+.dataTables_scrollBody {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(29, 79, 145, 0.45) transparent;
+}
+.card-body::-webkit-scrollbar,
+div.dataTables_wrapper::-webkit-scrollbar,
+.dataTables_scrollBody::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.card-body::-webkit-scrollbar-track,
+div.dataTables_wrapper::-webkit-scrollbar-track,
+.dataTables_scrollBody::-webkit-scrollbar-track {
+  background: transparent;
+}
+.card-body::-webkit-scrollbar-thumb,
+div.dataTables_wrapper::-webkit-scrollbar-thumb,
+.dataTables_scrollBody::-webkit-scrollbar-thumb {
+  background-color: rgba(29, 79, 145, 0.45);
+  border-radius: 4px;
+}
+
+/* Pages with a sidebar (## {.sidebar}) get an extra bslib wrapper chain
+   (.dashboard-sidebar-container > .bslib-sidebar-layout > .main) that
+   carries its own height:100% "fill" behavior on top of the dashboard's
+   own scrolling container - without this, that wrapper clips its content
+   to the viewport instead of letting the page grow/scroll like Page 1. */
+.dashboard-sidebar-container,
+.dashboard-sidebar-container .bslib-sidebar-layout,
+.dashboard-sidebar-container .bslib-sidebar-layout > .main {
+  height: auto !important;
+  overflow: visible !important;
+}
+
+.dashboard-sidebar-container,
+.dashboard-sidebar-container .bslib-sidebar-layout,
+.dashboard-sidebar-container .bslib-sidebar-layout > .main,
+.dashboard-sidebar-container aside.sidebar {
+  background: transparent !important;
+}
+
+/* Top-level page tabs: icon-only, with the page name as a custom tooltip
+   on hover instead of a plain text label (see index.qmd's nav-icon script,
+   which swaps each tab's text for this icon+label markup). Hover-only,
+   deliberately not :focus - a clicked link keeps browser focus after the
+   click, so including :focus here made the tooltip stay stuck open on
+   whichever tab was currently selected instead of disappearing once the
+   mouse moved away. */
+.navbar-nav .nav-link {
+  position: relative;
+}
+
+.navbar-nav .nav-icon {
+  font-size: 1.1rem;
+}
+
+.navbar-nav .nav-label {
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  white-space: nowrap;
+  background: rgba(20, 40, 70, 0.92);
+  color: #eaf2fb;
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 6px;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  z-index: 1050;
+}
+
+.navbar-nav .nav-link:hover .nav-label {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(8px);
+}
+
+/* Page title banner (::: {.page-title} ... :::), one per page, placed
+   above that page's tabset so it stays visible regardless of which sub-tab
+   (Огляд/Сирі дані/...) is active - duplicates the same text used in the
+   nav icon's hover tooltip, so the current page is always identifiable
+   without needing to hover. */
+.page-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #1b2f4a;
+  padding: 12px 20px 0 20px;
+}
+
+/* Dynamic per-map title (textOutput above each leafletOutput) - leaflet
+   has no native title slot like plotly's layout(title=), so this is a
+   plain text element instead, styled to match the plotly chart titles
+   set via chart_title() in the setup chunk. */
+.map-title {
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #1b2f4a;
+  padding: 2px 8px 4px 8px;
+}
+
+/* Value-box respondent base ("n = ...") under the main number. */
+.kpi-n {
+  font-size: 0.7rem;
+  font-weight: 400;
+  opacity: 0.85;
+}
+
+/* Value boxes: light text on the dark box colors, smaller title so long
+   question labels fit on 2-3 lines. */
+.bslib-value-box .value-box-title,
+.bslib-value-box .value-box-value {
+  color: #ffffff !important;
+}
+.bslib-value-box .value-box-title {
+  font-size: 0.8rem;
+}
+.bslib-value-box .value-box-showcase {
+  opacity: 0.35;
+}
+
+/* Static (OJS) pages: a plain auto-height grid of chart cards - Quarto's own
+   Row/Column cards can't resize to their content. Tall charts (many
+   categories) get `.wide` and span the full width. */
+.p1-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));  /* JS switches to 1 column when narrow */
+  gap: 16px;
+  padding: 8px 4px 24px 4px;
+  width: 100%;
+}
+.p1-card {
+  min-width: 0;
+}
+.p1-card.wide {
+  grid-column: 1 / -1;
+}
+.p1-note {
+  font-size: 0.75rem;
+  color: #4a6485;
+  padding: 0 12px 4px 12px;
+}
+.p1-empty {
+  padding: 24px 12px;
+  color: #1b2f4a;
+}
+
+/* Sidebar action button (Observable Inputs.button): readable on the blue theme. */
+.p1-reset {
+  background: #1d4f91 !important;
+  color: #ffffff !important;
+  border: none !important;
+  border-radius: 4px;
+  padding: 6px 16px;
+  cursor: pointer;
+}
+.p1-reset:hover {
+  background: #143a6b !important;
+}
+
+/* Rating KPI card inside a Type 5 grid (looks like a Page 0 value box). */
+.p1-kpi {
+  background: #1a7f8e;
+  color: #ffffff;
+  border-radius: 4px;
+  padding: 16px 20px;
+  height: 100%;
+  min-height: 150px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.p1-kpi-title { font-size: 0.85rem; }
+.p1-kpi-value { font-size: 2.2rem; font-weight: 500; line-height: 1.1; }
+.p1-kpi-value small { font-size: 1.1rem; opacity: 0.85; }
+.p1-kpi-n { font-size: 0.8rem; opacity: 0.9; }

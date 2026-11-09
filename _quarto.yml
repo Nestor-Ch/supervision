@@ -1,0 +1,12 @@
+project:
+  title: "Супервізія: опитування педагогів"
+  type: default
+  output-dir: docs
+
+format:
+  dashboard:
+    theme: cosmo
+    embed-resources: true
+    scrolling: true
+    css: custom.css
+    include-after-body: nav-icons.html

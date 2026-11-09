@@ -1,0 +1,22 @@
+# --- respondent-level data: NEVER commit (the repo is public) ---
+inputs/supervision_df_*.xlsx
+inputs/supervision_readable_*.xlsx
+inputs/dashboard_data/supervision_readable_*.xlsx
+inputs/dashboard_data/*_backup_*.xlsx
+*.csv
+
+# --- build / tooling ---
+.quarto/
+index_files/
+/index.html
+index.knit.md
+*.rmarkdown
+.Rhistory
+.Rproj.user/
+__pycache__/
+www/
+
+/.quarto/
+**/*.quarto_ipynb
+.RData
+*.RData

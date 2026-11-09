@@ -1,0 +1,1291 @@
+---
+title: "Супервізія: опитування педагогів"
+format: dashboard
+---
+
+```{r}
+#| include: false
+library(dplyr)
+library(tidyr)
+library(plotly)
+library(leaflet)
+library(sf)
+library(arrow)
+library(scales)
+library(openxlsx)
+
+# ---- data -------------------------------------------------------------------
+agg_cols <- c("ID", "admin", "admin_category", "option", "variable", "perc",
+              "general_count", "option_orig", "variable_orig")
+agg <- read_parquet("inputs/dashboard_data/clean_df.parquet", col_select = all_of(agg_cols)) %>%
+  mutate(response_count = round(perc * general_count))
+# Data problems (wrong labels, doubled prefixes, stale tables) are NOT patched here:
+# `python check_sheet.py` reports them and they are fixed at the source.
+
+# Overall (unfiltered) rows of one variable
+get_overall <- function(code) {
+  agg %>% filter(variable_orig == code, admin == "Overall")
+}
+get_label <- function(code) {
+  get_overall(code)$variable[1]
+}
+get_n <- function(code) {
+  get_overall(code)$general_count[1]
+}
+
+# Oblast polygons; rebuild recipe: data/build_oblast_geo.R
+oblast_geo <- sf::st_read("data/oblast_geo.geojson", quiet = TRUE)
+
+# ---- palette ----------------------------------------------------------------
+txt_color  <- "#1b2f4a"
+bar_color  <- "#2f6fb3"
+donut_cols <- c("#143a6b", "#4f8ccb", "#bcd6ef")
+map_ramp       <- c("#bcd3ea", "#8db8e0", "#5b97d0", "#2f6fb3", "#143a6b")
+map_zero_color <- "#f3e6cf"
+map_na_color   <- "#8a8a8a"
+kpi_pct_color  <- "#1d4f91"
+kpi_avg_color  <- "#1a7f8e"
+
+# ---- shared chart helpers ---------------------------------------------------
+wrap_label <- function(x, width = 28) {
+  vapply(x, function(s) paste(strwrap(s, width), collapse = "<br>"), character(1), USE.NAMES = FALSE)
+}
+
+# note: optional smaller second line (e.g. "можна обрати кілька варіантів")
+# width: wrap column; 120 fits a full-width chart, use ~60 for half-width ones
+chart_title <- function(text, note = NULL, width = 120) {
+  txt <- wrap_label(text, width)
+  if (!is.null(note)) {
+    txt <- paste0(txt, "<br><span style='font-size:12px;font-weight:normal'>", note, "</span>")
+  }
+  list(
+    text = txt, font = list(size = 14, color = txt_color),
+    x = 0.01, xanchor = "left", y = 1, yanchor = "top", yref = "container",
+    pad = list(t = 26), automargin = TRUE
+  )
+}
+
+bar_labels <- function(p, tickformat) {
+  style(p, texttemplate = paste0("%{x:", tickformat, "}"), textposition = "outside",
+        cliponaxis = FALSE,
+        hovertemplate = paste0("%{y}<br>%{x:", tickformat, "}<extra></extra>"))
+}
+
+bar_xaxis <- function(tickformat) {
+  ax <- list(tickformat = tickformat, showgrid = FALSE, zeroline = FALSE)
+  if (tickformat == ".0%") ax$range <- c(0, 1)
+  ax
+}
+
+# Single-series horizontal bars over `option`. `order` = option_orig values
+# top to bottom; NULL sorts by value (largest on top).
+hbar <- function(df, color = bar_color, value_col = "perc", tickformat = ".0%",
+                 title = NULL, order = NULL) {
+  df <- if (is.null(order)) df %>% arrange(desc(.data[[value_col]])) else df[match(order, df$option_orig), ]
+  df$label <- wrap_label(df$option)
+  p <- plot_ly(df, x = df[[value_col]], y = df$label, type = "bar", orientation = "h",
+               marker = list(color = color), customdata = df$response_count) %>%
+    bar_labels(tickformat) %>%
+    style(hovertemplate = paste0("%{y}<br>%{x:", tickformat, "} (n = %{customdata})<extra></extra>")) %>%
+    layout(
+      title = title,
+      xaxis = bar_xaxis(tickformat),
+      yaxis = list(title = "", categoryorder = "array", categoryarray = rev(df$label),
+                   showgrid = FALSE, zeroline = FALSE, automargin = TRUE),
+      margin = list(r = 50),
+      paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)",
+      font = list(color = txt_color)
+    ) %>%
+    config(displayModeBar = FALSE)
+  p
+}
+
+# ---- maps -------------------------------------------------------------------
+# Manual legend instead of colorBin so the scale stays fixed (see CLAUDE.md "Maps").
+# "perc": fixed 20 % bins; "share": finer bins for small shares of all respondents.
+# ("capped" - 95th-percentile bins for statistics/counts - is added when a numeric
+# page needs it.)
+map_scale <- function(values, mode = c("share", "perc")) {
+  mode <- match.arg(mode)
+  pct <- values * 100
+  if (mode == "share") {
+    breaks <- c(0, 5, 10, 15, 20, Inf)
+    labs   <- c("1–5 %", "6–10 %", "11–15 %", "16–20 %", "> 20 %")
+    bin    <- cut(pct, breaks, labels = FALSE, right = TRUE)
+  } else {
+    breaks <- c(0, 20, 40, 60, 80, Inf)
+    labs   <- c("1–19 %", "20–39 %", "40–59 %", "60–79 %", "80–100 %")
+    bin    <- cut(pct, breaks, labels = FALSE, right = FALSE)
+  }
+  colors <- ifelse(is.na(pct), map_na_color,
+            ifelse(pct == 0, map_zero_color, map_ramp[bin]))
+  legend_colors <- c(map_zero_color, map_ramp)
+  legend_labels <- c("0 %", labs)
+  if (anyNA(values)) {
+    legend_colors <- c(legend_colors, map_na_color)
+    legend_labels <- c(legend_labels, "немає даних")
+  }
+  list(colors = colors, legend_colors = legend_colors, legend_labels = legend_labels)
+}
+
+# ---- value boxes ------------------------------------------------------------
+# Quarto escapes HTML in a value box's `value`, so the count goes into the title.
+# "% yes" cards: the number of respondents who gave the counted answer(s);
+# "average" cards (yes_options = NULL): everyone who answered. Non-breaking
+# spaces so a number never wraps mid-way.
+kpi_title <- function(label, code, yes_options = NULL) {
+  nb <- " "
+  if (is.null(yes_options)) {
+    sprintf("%s (відповіли%s%s)", label, nb, comma(get_n(code), big.mark = nb))
+  } else {
+    d <- get_overall(code)
+    n <- sum(d$response_count[d$option_orig %in% yes_options])
+    sprintf("%s (%s%sреспондентів)", label, comma(n, big.mark = nb), nb)
+  }
+}
+# Subtitle line under a chart title: the question's total respondents, plus an
+# optional extra (e.g. the multi-select note).
+answered_note <- function(code, extra = NULL) {
+  paste(c(sprintf("Відповіли %s", comma(get_n(code), big.mark = " ")), extra), collapse = " · ")
+}
+# Share of respondents giving one of `yes_options` (option_orig values).
+kpi_pct <- function(code, yes_options, icon) {
+  d <- get_overall(code)
+  list(icon = icon, color = kpi_pct_color,
+       value = percent(sum(d$perc[d$option_orig %in% yes_options]), accuracy = 1))
+}
+# Mean of a 1-5 rating, from the per-score shares.
+kpi_avg <- function(code, icon) {
+  d <- get_overall(code)
+  m <- sum(as.numeric(d$option_orig) * d$perc) / sum(d$perc)
+  list(icon = icon, color = kpi_avg_color,
+       value = sprintf("%.1f / 5", m))
+}
+```
+
+# Загальне
+
+## Row {height=190px}
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Добре розуміють, що таке супервізія", "q_awareness", "understand_well")
+kpi_pct("q_awareness", "understand_well", "lightbulb")
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Знають, як замовити супервізію", "q_know_how_order", "yes")
+kpi_pct("q_know_how_order", "yes", "cart-check")
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Брали участь у супервізії", "q_participated", "yes")
+kpi_pct("q_participated", "yes", "person-check")
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Колектив поінформований (усі або більшість)", "q_staff_informed", c("all", "most"))
+kpi_pct("q_staff_informed", c("all", "most"), "megaphone")
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Корисність супервізії для педагога", "q_usefulness_general")
+kpi_avg("q_usefulness_general", "star")
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Відповідність супервізії очікуванням", "q_matched_expectations")
+kpi_avg("q_matched_expectations", "bullseye")
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr kpi_title("Корисність супервізії для респондента", "q_usefulness_personal")
+kpi_avg("q_usefulness_personal", "hand-thumbs-up")
+```
+
+## Row {height=600px}
+
+### Column {width=55%}
+
+```{r}
+map_df0 <- oblast_geo %>%
+  left_join(get_overall("q_oblast") %>% select(option, perc, response_count),
+            by = c("name" = "option"))
+sc <- map_scale(map_df0$perc, "share")
+tip <- lapply(seq_len(nrow(map_df0)), function(i) {
+  htmltools::HTML(if (is.na(map_df0$perc[i])) {
+    sprintf("<b>%s</b><br>немає даних", map_df0$name[i])
+  } else {
+    sprintf("<b>%s</b><br>%s респондентів (n = %s)", map_df0$name[i],
+            percent(map_df0$perc[i], accuracy = 0.1), comma(map_df0$response_count[i], big.mark = " "))
+  })
+})
+leaflet(map_df0, options = leafletOptions(scrollWheelZoom = FALSE, zoomSnap = 0.1, zoomDelta = 0.5)) %>%
+  addPolygons(fillColor = sc$colors, fillOpacity = 1, color = "#ffffff", weight = 1,
+              label = tip, highlightOptions = highlightOptions(weight = 2, color = txt_color)) %>%
+  addLegend(position = "bottomright", colors = sc$legend_colors, labels = sc$legend_labels,
+            opacity = 1) %>%
+  htmlwidgets::prependContent(htmltools::div(
+    class = "map-title",
+    sprintf("Частка респондентів за областями (n = %s)", comma(get_n("q_oblast"), big.mark = " "))))
+```
+
+### Column {width=45%}
+
+```{r}
+d <- get_overall("q_posada")
+d <- d[match(c("head", "deputy", "teacher"), d$option_orig), ]
+plot_ly(d, labels = wrap_label(d$option, 34), values = d$perc, type = "pie", hole = 0.55,
+        sort = FALSE, direction = "clockwise", textposition = "outside",
+        texttemplate = "%{percent:.1%}", domain = list(x = c(0, 0.5)),
+        customdata = d$response_count, marker = list(colors = donut_cols),
+        hovertemplate = "%{label}<br>%{percent} (n = %{customdata})<extra></extra>",
+        showlegend = TRUE) %>%
+  layout(title = chart_title(get_label("q_posada"), answered_note("q_posada"), width = 60),
+         legend = list(orientation = "v", x = 1, xanchor = "right", y = 0.5),
+         margin = list(l = 20, r = 20, t = 85, b = 20),
+         paper_bgcolor = "rgba(0,0,0,0)", plot_bgcolor = "rgba(0,0,0,0)",
+         font = list(color = txt_color)) %>%
+  config(displayModeBar = FALSE)
+```
+
+```{r}
+hbar(get_overall("q_experience"), title = chart_title(get_label("q_experience"), answered_note("q_experience"), width = 60),
+     order = c("under3", "3_9", "10_19", "over20"))
+```
+
+## Row {height=520px}
+
+```{r}
+multi_note <- "Можна обрати кілька варіантів"
+hbar(get_overall("q_grades"), title = chart_title(get_label("q_grades"), answered_note("q_grades", multi_note), width = 60),
+     order = c(paste0("grade", 1:11), "n0ne", "other"))  # "n0ne" (zero) is deliberate: it stops Python reading the code as a None/NaN value
+```
+
+```{r}
+hbar(get_overall("q_role_understanding"),
+     title = chart_title(get_label("q_role_understanding"), answered_note("q_role_understanding", multi_note), width = 60),
+     order = c("control_check", "experience_exchange", "consultation", "professional_support"))
+```
+
+# Поінформованість
+
+## {.sidebar}
+
+```{r}
+#| include: false
+# ---- data for pages 1-5, shipped to the browser as JSON (static dashboard) ------
+# sheet_classification.xlsx is the single source for the page structure: which cards are
+# on which page ("pages"), in which order, drawn how (the controlled chart vocabulary),
+# the dropdown choices ("main" + "breakdowns") and the small-group threshold. The KoBo
+# form says which questions are select_multiple (shares sum to more than 100 %).
+# Data problems are NOT worked around here: `python check_sheet.py` reports them.
+# openxlsx returns this file's non-ASCII text entity-encoded ("&#1044;..."): Plotly
+# would still draw it, but sorting by label and wrapping by length would not work.
+decode_entities <- function(x) {
+  vapply(x, function(s) {
+    if (is.na(s) || !grepl("&", s, fixed = TRUE)) return(s)
+    for (cd in unique(regmatches(s, gregexpr("&#[0-9]+;", s))[[1]]))
+      s <- gsub(cd, intToUtf8(as.integer(gsub("[&#;]", "", cd))), s, fixed = TRUE)
+    gsub("&amp;", "&", s, fixed = TRUE)
+  }, character(1), USE.NAMES = FALSE)
+}
+decode_df <- function(d) { d[] <- lapply(d, function(col) if (is.character(col)) decode_entities(col) else col); d }
+sheet_path <- "inputs/dashboard_data/sheet_classification.xlsx"
+sheet    <- decode_df(read.xlsx(sheet_path, sheet = "survey"))
+pspec    <- decode_df(read.xlsx(sheet_path, sheet = "main"))
+bk_sheet <- decode_df(read.xlsx(sheet_path, sheet = "breakdowns"))
+vocab    <- decode_df(read.xlsx(sheet_path, sheet = "lists"))
+kobo     <- read.xlsx("inputs/supervision_survey_educators_2.xlsx", sheet = "survey")
+multi_codes <- kobo$name[grepl("^select_multiple", kobo$type)]
+
+# fail loudly on a word outside the vocabulary instead of guessing what was meant
+for (cl in c("Graph_type", "page_0_graph_type", "Page_gen_type_graph", "Page_graph_disag_chosen",
+             "Orientation_overall", "Layout_hint", "Multi_select", "Hidden_when_breakdown", "asked_of")) {
+  lst <- if (cl %in% c("Multi_select", "Hidden_when_breakdown")) "yes_no" else cl
+  bad <- setdiff(na.omit(sheet[[cl]]), na.omit(vocab[[lst]]))
+  if (length(bad)) stop("sheet_classification.xlsx, column ", cl, ": ", paste(bad, collapse = ", "),
+                        " is not in the vocabulary (see the legend sheet)", call. = FALSE)
+}
+page_of   <- function(s) as.integer(strsplit(as.character(s), "[;,]")[[1]])
+std_pages <- pspec$page[pspec$page_type == "type5_standard"]
+cmp_page  <- pspec$page[pspec$page_type == "type5_comparison"]
+spec_of   <- function(p) pspec[pspec$page == p, ]
+p_admins  <- unique(c("Overall", unlist(strsplit(pspec$breakdowns[pspec$page %in% std_pages], ";"))))
+
+membership <- bind_rows(lapply(seq_len(nrow(sheet)), function(i) {
+  pg <- page_of(sheet$pages[i]); pg <- pg[pg %in% std_pages]   # the comparison page has its own builder
+  if (!length(pg)) return(NULL)
+  data.frame(code = sheet$name[i], page = pg, g = sheet$Page_gen_type_graph[i],
+             d = sheet$Page_graph_disag_chosen[i], orient = sheet$Orientation_overall[i],
+             pos = sheet$Card_order[i], layout_hint = sheet$Layout_hint[i])
+}))
+pg_cfg <- membership %>%
+  mutate(
+    overall = case_when(g == "kpi_card" ~ "kpi", g == "donut" ~ "donut", g == "bar" ~ "bar"),
+    disag   = case_when(d == "stacked_bar" ~ "stacked", d == "heatmap" ~ "heatmap", d == "mean_bar" ~ "mean"),
+    label = vapply(code, get_label, character(1)),
+    multi = code %in% multi_codes,
+    keep_order = code == "q_years",                  # chronological, not by value
+    vertical = coalesce(orient == "vertical", FALSE), # overall bar drawn as columns that fill their row
+    layout_hint = coalesce(layout_hint, "auto"),
+    min_n = vapply(page, function(p) as.numeric(spec_of(p)$min_n), numeric(1))
+  )
+if (anyNA(pg_cfg$pos) || any(duplicated(pg_cfg[c("page", "pos")])))
+  stop("sheet_classification.xlsx: Card_order must be filled and unique within each page", call. = FALSE)
+pg_cfg <- pg_cfg %>% arrange(page, pos)
+# a pie/donut needs mutually exclusive answers
+stopifnot(!any(pg_cfg$multi & pg_cfg$overall == "donut"), !anyNA(pg_cfg$overall), !anyNA(pg_cfg$disag))
+codes_all <- unique(pg_cfg$code)
+vmin <- pg_cfg %>% distinct(code, min_n)   # small-group threshold of the page a question is on
+
+# Fixed answer order (option_orig) where it is meaningful - most to least
+# positive. Everything else: numbers ascending, else by overall share. Neutral
+# answers always go last and are grey.
+p_order <- list(
+  q_awareness      = c("understand_well", "partial", "heard_not_understand", "not_familiar"),
+  q_know_how_order = c("yes", "partial", "no"),
+  q_info_enough    = c("yes", "partial", "no"),
+  q_staff_informed = c("all", "most", "some", "no"),
+  q_participated   = c("yes", "no"),
+  q_tried_order    = c("yes_success", "yes_failed", "no"),
+  q_staff_applied  = c("many_times", "once", "isolated_cases", "no", "dont_know"),
+  q_organized_level = c("systematically", "episodically", "no"),
+  q_applied_results = c("fully", "partially", "not_yet", "no_recommendations"),
+  q_admin_role     = c("actively_initiates", "supports")
+)
+neutral_opts <- c("other", "dk", "dont_know", "did_not_receive")
+ramps <- list(
+  "1" = "#2f6fb3",
+  "2" = c("#143a6b", "#7fb0de"),
+  "3" = c("#143a6b", "#4f8ccb", "#bcd6ef"),
+  "4" = c("#143a6b", "#2f6fb3", "#7fb0de", "#bcd6ef"),
+  "5" = c("#143a6b", "#2f6fb3", "#5b97d0", "#8fbbe3", "#c3dbf0")
+)
+neutral_color <- "#b9c4d0"
+
+pg_opts <- bind_rows(lapply(codes_all, function(cd) {
+  o <- get_overall(cd) %>%
+    transmute(code = cd, option_orig, option = sub("\\.0$", "", option), perc,
+              neutral = option_orig %in% neutral_opts)
+  num <- suppressWarnings(as.numeric(o$option_orig))
+  o <- if (!is.null(p_order[[cd]])) {
+    o %>% arrange(match(option_orig, p_order[[cd]]))
+  } else if (!anyNA(num)) {
+    o %>% arrange(as.numeric(option_orig))
+  } else {
+    o %>% arrange(neutral, desc(perc))
+  }
+  n <- sum(!o$neutral)
+  cols <- if (n == 0) character(0) else if (n <= 5) ramps[[as.character(n)]] else
+    colorRampPalette(c("#143a6b", "#bcd6ef"))(n)
+  o$color <- neutral_color
+  o$color[!o$neutral] <- cols
+  o$rank <- seq_len(nrow(o))
+  o %>% select(code, option_orig, option, rank, color)
+}))
+
+base <- agg %>% filter(variable_orig %in% codes_all, admin %in% p_admins)
+cells <- base %>% distinct(variable_orig, admin, admin_category, general_count) %>%
+  left_join(vmin, by = c("variable_orig" = "code"))
+pg_dropped <- cells %>%
+  filter(admin != "Overall") %>%
+  group_by(variable_orig, admin) %>%
+  summarise(n_dropped = sum(general_count < min_n), n_total = n(), .groups = "drop")
+
+# Zero-fill: the pipeline omits options nobody chose in a category
+pg_rows <- cells %>%
+  filter(admin == "Overall" | general_count >= min_n) %>%
+  inner_join(pg_opts %>% select(variable_orig = code, option_orig, rank),
+             by = "variable_orig", relationship = "many-to-many") %>%
+  left_join(base %>% select(variable_orig, admin, admin_category, option_orig, perc),
+            by = c("variable_orig", "admin", "admin_category", "option_orig")) %>%
+  mutate(perc = coalesce(perc, 0), count = round(perc * general_count)) %>%
+  select(variable_orig, admin, admin_category, option_orig, rank,
+         perc, count, base = general_count)
+
+ojs_define(
+  pg_cfg = pg_cfg %>% select(page, pos, code, label, multi, overall, disag, keep_order, vertical, layout_hint),
+  pg_opts = pg_opts, pg_rows = pg_rows, pg_dropped = pg_dropped,
+  pg_bk = bk_sheet %>% select(code, label_uk, title_suffix_uk, noun_uk, category_order),
+  pg_spec = pspec %>% select(page, breakdowns, value_toggle, min_n)
+)
+```
+
+```{ojs}
+//| output: false
+cfgs = transpose(pg_cfg)
+opts = transpose(pg_opts)
+rows = transpose(pg_rows)
+dropped = transpose(pg_dropped)
+bks = transpose(pg_bk)        // breakdowns sheet: labels, wording, category order
+pspecs = transpose(pg_spec)   // main sheet: breakdown choices, value toggle, threshold
+Plotly = require("plotly.js-dist-min@2.35.2")
+
+// ---- sidebar controls, one set per page (choices come from the sheet) -----------
+breakdownSelect = page => {
+  const spec = pspecs.find(p => +p.page === page);
+  const choices = spec.breakdowns.split(";").map(c => [bks.find(b => b.code === c).label_uk, c]);
+  return Inputs.select(new Map(choices), {label: "Розбиття", value: "Overall"});
+}
+valueRadio = page => {
+  const spec = pspecs.find(p => +p.page === page);
+  if (spec.value_toggle !== "yes") {          // no toggle on this page: a hidden "perc"
+    const el = html`<div hidden></div>`; el.value = "perc"; return el;
+  }
+  return Inputs.radio(new Map([["Відсотки", "perc"], ["Кількість", "count"]]),
+    {label: "Показувати", value: "perc"});
+}
+resetButton = (disagInput, valueInput) => {
+  const form = Inputs.button("Скинути", {reduce: () => {
+    for (const [v, val] of [[disagInput, "Overall"], [valueInput, "perc"]]) {
+      v.value = val;
+      v.dispatchEvent(new Event("input", {bubbles: true}));
+    }
+  }});
+  form.querySelector("button").classList.add("p1-reset");
+  return form;
+}
+```
+
+```{ojs}
+//| output: false
+// Helpers shared by every Type 5 page kind (renderPage, renderComparePage):
+// title/label styling and the card grid with its layout + redraw logic.
+gridKit = {
+  const TXT = "#1b2f4a";
+  const wrap = (s, w) => {
+    const lines = [];
+    let cur = "";
+    for (const word of String(s).split(" ")) {
+      if (cur && (cur + " " + word).length > w) { lines.push(cur); cur = word; }
+      else cur = cur ? cur + " " + word : word;
+    }
+    if (cur) lines.push(cur);
+    return lines.join("<br>");
+  };
+  const titleOf = (text, note, w) => ({
+    text: wrap(text, w) + (note ? `<br><span style="font-size:12px;font-weight:normal">${note}</span>` : ""),
+    font: {size: 14, color: TXT}, x: 0.01, xanchor: "left", y: 1, yanchor: "top",
+    yref: "container", pad: {t: 26}, automargin: true
+  });
+  // fixed system font stack: Plotly caches text widths measured before a web font loads
+  const baseLayout = {paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: {color: TXT, family: "Arial, Helvetica, sans-serif"}};
+  const isLight = hex => {
+    const n = parseInt(hex.slice(1), 16);
+    return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) > 140;
+  };
+
+  // cards: [{el, wide, slots, parts: [{plot, build(slots) -> {traces, layout, height}}]}]
+  // (a card with a single `plot` + `build` is accepted too).
+  // Two columns when there is room, one otherwise. A card that would be alone in
+  // its row (last card, or the one before a full-width card) takes the whole row,
+  // so the grid never leaves a blank half-row. Cards that share a row also share
+  // a "slots" count (bars per plot), so their axes line up along the bottom.
+  function mountGrid(cards, invalidation) {
+    const root = html`<div class="p1-grid"></div>`;
+    cards.forEach(c => root.appendChild(c.el));
+    let rowGroups = [];  // the cards of each grid row, set by layoutGrid
+    const layoutGrid = () => {
+      const ncol = root.clientWidth >= 880 ? 2 : 1;
+      root.style.gridTemplateColumns = `repeat(${ncol}, minmax(0, 1fr))`;
+      const groups = [];
+      let cur = [];
+      const flush = () => { if (cur.length) groups.push(cur); cur = []; };
+      cards.forEach((c, i) => {
+        let full = c.wide || c.hint === "full_row";       // Layout_hint from the sheet
+        if (c.hint === "new_row" && cur.length === 1) { cur[0].el.style.gridColumn = "1 / -1"; flush(); }
+        else if (c.hint === "new_row") flush();
+        if (full || ncol === 1) { flush(); groups.push([c]); }
+        else {
+          const next = cards[i + 1];
+          if (cur.length === 0 && (!next || next.wide || next.hint === "full_row" || next.hint === "new_row")) { full = true; groups.push([c]); }
+          else { cur.push(c); if (cur.length === 2) flush(); }
+        }
+        c.el.style.gridColumn = full ? "1 / -1" : "auto";
+      });
+      flush();
+      groups.forEach(g => {
+        const m = Math.max(0, ...g.map(c => c.slots));
+        g.forEach(c => { c.useSlots = c.slots ? m : 0; });
+      });
+      rowGroups = groups;
+    };
+    let lastW = -1;
+    const partsOf = c => c.parts || (c.plot && c.build ? [{plot: c.plot, build: c.build, fill: c.fill}] : []);
+    const draw = () => {
+      layoutGrid();
+      // A part marked `fill` (a vertical bar chart) stretches to the height of the
+      // tallest other card in its row, so it uses the space instead of leaving a gap.
+      rowGroups.forEach(g => {
+        const rowH = Math.max(0, ...g.map(c => partsOf(c).filter(p => !p.fill)
+          .reduce((sum, p) => sum + p.build(c.useSlots).height, 0)));
+        g.forEach(c => { c.rowH = rowH; });
+      });
+      cards.forEach(c => {
+        partsOf(c).forEach(p => {
+          const b = p.build(c.useSlots, c.rowH);
+          p.plot.style.height = b.height + "px";
+          Plotly.react(p.plot, b.traces, {...baseLayout, ...b.layout, height: b.height},
+            {displayModeBar: false, responsive: true});
+          Plotly.Plots.resize(p.plot);
+        });
+      });
+    };
+    // Plotly measures its container, so draw once the grid is in the document.
+    const go = () => root.isConnected ? (lastW = root.clientWidth, draw()) : requestAnimationFrame(go);
+    requestAnimationFrame(go);
+    // Plotly's own `responsive` only listens to window resizes; the sidebar
+    // opening/closing changes the container width without one.
+    const ro = new ResizeObserver(() => {
+      if (Math.abs(root.clientWidth - lastW) < 2) return;
+      lastW = root.clientWidth;
+      draw();
+    });
+    ro.observe(root);
+    invalidation.then(() => ro.disconnect());
+    return root;
+  }
+  // category order of a breakdown comes from the breakdowns sheet: an explicit list, or by size
+  const sortCats = (cats, bk, sizeOf) => {
+    const ord = bk && bk.category_order;
+    if (ord && ord !== "by_size") { const list = ord.split(";"); cats.sort((a, b) => list.indexOf(a) - list.indexOf(b)); }
+    else cats.sort((a, b) => sizeOf(b) - sizeOf(a));
+  };
+  return {TXT, wrap, titleOf, baseLayout, isLight, mountGrid, sortCats};
+}
+```
+
+```{ojs}
+//| output: false
+// One card grid per page: a card per variable, chart type chosen by (question
+// kind x breakdown). See CLAUDE.md "Type 5".
+renderPage = function(page, disag, valtype, invalidation) {
+  const TXT = "#1b2f4a", BAR = "#2f6fb3", KPI = "#1a7f8e";
+  const bkOf = code => bks.find(b => b.code === code) || {};
+  const NOUN = new Proxy({}, {get: (_, k) => bkOf(k).noun_uk});             // from the breakdowns sheet
+  const BY = new Proxy({}, {get: (_, k) => bkOf(k).title_suffix_uk});
+  const MULTI_NOTE = "Можна обрати кілька варіантів";
+  const MIN_N = +pspecs.find(p => +p.page === page).min_n;                  // from the main sheet
+  const isCount = valtype === "count";
+  const key = isCount ? "count" : "perc";
+  const fmt = isCount ? ",d" : ".0%";
+  const overall = disag === "Overall";
+
+  const {wrap, titleOf, baseLayout, isLight, mountGrid, sortCats} = gridKit;
+  const yAxis = (wide, slots) => ({
+    ...(wide ? {autorange: "reversed"} : {range: [slots - 0.5, -0.5]}),
+    type: "category", automargin: true, showgrid: false, zeroline: false, tickfont: {size: 11}});
+
+  // px per bar in the overall bar charts: enough for the longest wrapped label on the page
+  const barLines = Math.max(1, ...cfgs.filter(c => c.page === page && c.overall === "bar")
+    .flatMap(c => opts.filter(d => d.code === c.code).map(d => wrap(d.option, 30).split("<br>").length)));
+  const slotPx = Math.max(34, 14 * barLines + 10);
+
+  // Top margin shared by every card on the page (cards in a row keep aligned
+  // axes): room for the longest title as it would wrap in a half-width card,
+  // plus the subtitle line.
+  const titleLinesMax = Math.max(1, ...cfgs.filter(c => c.page === page).map(c =>
+    wrap(`${c.label} (за стажем роботи), середня оцінка (1–5)`, 60).split("<br>").length));
+  const topPx = 36 + 17 * (titleLinesMax + 1);
+
+  const makeCard = c => {
+    const o = opts.filter(d => d.code === c.code).sort((a, b) => a.rank - b.rank);
+    const rs = rows.filter(d => d.variable_orig === c.code && d.admin === disag);
+    const cats = [...new Set(rs.map(d => d.admin_category))];
+    const baseOf = new Map(rs.map(d => [d.admin_category, d.base]));
+    sortCats(cats, bkOf(disag), k => baseOf.get(k));
+    const val = (cat, opt, k = key) => {
+      const r = rs.find(d => d.admin_category === cat && d.option_orig === opt);
+      return r ? r[k] : 0;
+    };
+    const mean = cat => o.reduce((s, d) => s + parseFloat(d.option_orig) * val(cat, d.option_orig, "perc"), 0);
+    const oc = cats[0];  // the single Overall category (its spelling varies in the data)
+    const full = overall ? c.label : `${c.label} (${BY[disag]})`;
+    // subtitle: the question's total respondents (Overall base), plus the multi-select note
+    const totalN = rows.find(d => d.variable_orig === c.code && d.admin === "Overall").base;
+    const note = [`Відповіли ${totalN.toLocaleString("uk-UA")}`, c.multi ? MULTI_NOTE : null]
+      .filter(Boolean).join(" · ");
+    const dr = dropped.find(d => d.variable_orig === c.code && d.admin === disag && d.n_dropped > 0);
+    const noteText = dr
+      ? `Не показано ${dr.n_dropped} з ${dr.n_total} ${NOUN[disag]}: менше ніж ${MIN_N} респондентів.` : "";
+    const yl = () => cats.map(k => `${k} (n = ${baseOf.get(k)})`);
+
+    // kind: kpi | donut | bar | heat | stack | mean | empty
+    let kind, wide = false, slots = 0, build = null, fill = false;
+    if (!overall && cats.length < 2) kind = "empty";
+    else if (overall && c.overall === "kpi") kind = "kpi";
+    else if (overall && c.overall === "donut") kind = "donut";
+    else if (overall) kind = "bar";
+    else if (c.disag === "heatmap") { kind = "heat"; wide = true; }
+    else if (c.disag === "mean") { kind = "mean"; wide = cats.length > 8; }
+    else { kind = "stack"; wide = cats.length > 8; }
+    const tw = wide ? 120 : 60;
+
+    if (kind === "donut") {
+      build = () => ({height: 360,
+        traces: [{
+          type: "pie", hole: 0.55, sort: false, direction: "clockwise",
+          labels: o.map(d => wrap(d.option, 14)),
+          values: o.map(d => val(oc, d.option_orig)),
+          customdata: o.map(d => val(oc, d.option_orig, "count")),
+          marker: {colors: o.map(d => d.color)}, textposition: "outside",
+          texttemplate: isCount ? "%{value:,d}" : "%{percent:.1%}",
+          hovertemplate: "%{label}<br>%{percent:.1%} (n = %{customdata})<extra></extra>",
+          domain: {x: [0.04, 0.5], y: [0.08, 0.92]}
+        }],
+        layout: {title: titleOf(full, note, tw), showlegend: true,
+          legend: {orientation: "v", x: 0.54, xanchor: "left", y: 0.5, font: {size: 11}},
+          margin: {l: 20, r: 20, t: topPx, b: 20}}});
+    } else if (kind === "bar" && c.vertical) {
+      // columns instead of bars; stretches to the height of its row (see mountGrid)
+      const sorted = c.keep_order ? [...o]
+        : [...o].sort((a, b) => val(oc, b.option_orig) - val(oc, a.option_orig));
+      const labs = sorted.map(d => wrap(d.option, 14));
+      const lines = Math.max(...labs.map(t => t.split("<br>").length));
+      fill = true;
+      build = (sl, fillH) => ({height: Math.max(topPx + 210 + 14 * lines, fillH || 0),
+        traces: [{
+          type: "bar", orientation: "v", marker: {color: BAR},
+          x: labs, y: sorted.map(d => val(oc, d.option_orig)),
+          customdata: sorted.map(d => val(oc, d.option_orig, "count")),
+          texttemplate: `%{y:${fmt}}`, textposition: "outside", cliponaxis: false,
+          hovertemplate: `%{x}<br>%{y:${fmt}} (n = %{customdata})<extra></extra>`
+        }],
+        layout: {title: titleOf(full, note, tw), margin: {l: 55, r: 20, t: topPx, b: 20},
+          xaxis: {type: "category", automargin: true, showgrid: false, tickfont: {size: 11}, tickangle: 0},
+          yaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]}}});
+    } else if (kind === "bar") {
+      const sorted = c.keep_order ? [...o]
+        : [...o].sort((a, b) => val(oc, b.option_orig) - val(oc, a.option_orig));
+      slots = o.length;
+      build = sl => ({height: topPx + 60 + slotPx * sl,
+        traces: [{
+          type: "bar", orientation: "h", marker: {color: BAR},
+          x: sorted.map(d => val(oc, d.option_orig)),
+          y: sorted.map(d => wrap(d.option, 30)),
+          customdata: sorted.map(d => val(oc, d.option_orig, "count")),
+          texttemplate: `%{x:${fmt}}`, textposition: "outside", cliponaxis: false,
+          hovertemplate: `%{y}<br>%{x:${fmt}} (n = %{customdata})<extra></extra>`
+        }],
+        layout: {title: titleOf(full, note, tw), margin: {l: 10, r: 60, t: topPx, b: 40},
+          xaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+          yaxis: yAxis(false, sl)}});
+    } else if (kind === "heat") {
+      const xl = o.map(d => wrap(d.option, o.length > 8 ? 11 : 16));  // narrower columns -> narrower labels
+      const labLines = Math.max(...xl.map(t => t.split("<br>").length));
+      const titleLines = wrap(full, tw).split("<br>").length + (note ? 1 : 0);
+      const top = 40 + titleLines * 18 + labLines * 14;
+      build = () => ({height: top + 26 * cats.length + 60,
+        traces: [{
+          type: "heatmap", x: xl, y: yl(),
+          z: cats.map(k => o.map(d => val(k, d.option_orig))),
+          customdata: cats.map(k => o.map(d => val(k, d.option_orig, "count"))),
+          colorscale: [[0, "#e8f1fa"], [0.5, "#6fa5d8"], [1, "#143a6b"]],
+          zmin: 0, zmax: isCount ? undefined : 1, xgap: 2, ygap: 2,
+          texttemplate: isCount ? "%{z:,d}" : "%{z:.0%}",
+          colorbar: {tickformat: fmt, thickness: 12, len: 0.6},
+          hovertemplate: `%{y}<br>%{x}<br>%{z:${fmt}} (n = %{customdata})<extra></extra>`
+        }],
+        layout: {title: titleOf(full, note, tw), margin: {l: 215, r: 10, t: top, b: 10},
+          xaxis: {type: "category", side: "top", automargin: true, showgrid: false, tickfont: {size: 11}, tickangle: 0},
+          yaxis: {type: "category", autorange: "reversed", automargin: true, showgrid: false, tickfont: {size: 11}}}});
+    } else if (kind === "stack") {
+      // the legend (one wrapped entry per answer) must fit the plot height, or it scrolls
+      const legendH = o.reduce((s, d) => s + wrap(d.option, 20).split("<br>").length * 14 + 8, 0);
+      slots = Math.max(cats.length, Math.ceil((legendH - 40) / 30));
+      const maxBase = Math.max(...cats.map(k => baseOf.get(k)));
+      build = sl => ({height: topPx + 80 + 30 * sl,
+        traces: o.map(d => ({
+          type: "bar", orientation: "h", name: wrap(d.option, 20),
+          x: cats.map(k => val(k, d.option_orig)), y: yl(),
+          marker: {color: d.color, line: {color: "#ffffff", width: 1}},
+          customdata: cats.map(k => val(k, d.option_orig, "count")),
+          text: cats.map(k => val(k, d.option_orig, "count") >= 0.07 * (isCount ? maxBase : baseOf.get(k))
+            ? (isCount ? String(val(k, d.option_orig, "count")) : (val(k, d.option_orig, "perc") * 100).toFixed(0) + "%") : ""),
+          textposition: "inside", insidetextanchor: "middle", textangle: 0,
+          textfont: {color: isLight(d.color) ? TXT : "#ffffff", size: 11},
+          hovertemplate: `%{y}<br>${d.option}: %{x:${fmt}} (n = %{customdata})<extra></extra>`
+        })),
+        layout: {title: titleOf(full, note, tw), barmode: "stack",
+          margin: {l: 185, r: 190, t: topPx, b: 40},
+          xaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+          yaxis: yAxis(wide, sl),
+          legend: {orientation: "v", x: 1.01, xanchor: "left", y: 1, yanchor: "top",
+                   traceorder: "normal", font: {size: 11}}}});
+    } else if (kind === "mean") {
+      // average rating (1-5) per category; unaffected by the percent/count switch
+      slots = cats.length;
+      build = sl => ({height: topPx + 60 + 30 * sl,
+        traces: [{
+          type: "bar", orientation: "h", marker: {color: KPI},
+          x: cats.map(mean), y: yl(),
+          customdata: cats.map(k => baseOf.get(k)),
+          text: cats.map(k => mean(k).toFixed(1)), textposition: "outside", cliponaxis: false,
+          hovertemplate: "%{y}<br>середня оцінка: %{x:.2f}<extra></extra>"
+        }],
+        layout: {title: titleOf(`${full}, середня оцінка (1–5)`, note, tw), margin: {l: 185, r: 50, t: topPx, b: 40},
+          xaxis: {range: [0, 5], dtick: 1, showgrid: false, zeroline: false},
+          yaxis: yAxis(wide, sl)}});
+    }
+
+    let inner;
+    if (kind === "kpi") {
+      const base = rs.length ? rs[0].base : 0;
+      inner = html`<div class="p1-kpi">
+        <div class="p1-kpi-title">${c.label}</div>
+        <div class="p1-kpi-value">${mean(oc).toFixed(1)} <small>/ 5</small></div>
+        <div class="p1-kpi-n">відповіли ${base.toLocaleString("uk-UA")}</div></div>`;
+    } else if (kind === "empty") {
+      inner = html`<div class="p1-empty">${c.label}<br><em>Недостатньо даних для порівняння: менше двох ${NOUN[disag]} мають щонайменше ${MIN_N} респондентів.</em></div>`;
+    } else {
+      inner = html`<div class="p1-plot"></div>`;
+    }
+    const el = html`<div class="p1-card${wide ? " wide" : ""}">${inner}
+      ${noteText ? html`<div class="p1-note">${noteText}</div>` : ""}</div>`;
+    return {el, plot: el.querySelector(".p1-plot"), kind, wide, slots, build, fill, useSlots: slots, hint: c.layout_hint};
+  };
+
+  const cards = cfgs.filter(c => c.page === page).sort((a, b) => a.pos - b.pos).map(makeCard);
+  return mountGrid(cards, invalidation);
+}
+```
+
+```{ojs}
+viewof disag1 = breakdownSelect(1)
+```
+
+```{ojs}
+viewof valtype1 = valueRadio(1)
+```
+
+```{ojs}
+viewof reset1 = resetButton(viewof disag1, viewof valtype1)
+```
+
+## Row {.flow}
+
+```{ojs}
+grid1 = renderPage(1, disag1, valtype1, invalidation)
+```
+
+# Замовлення супервізії
+
+## {.sidebar}
+
+```{ojs}
+viewof disag2 = breakdownSelect(2)
+```
+
+```{ojs}
+viewof valtype2 = valueRadio(2)
+```
+
+```{ojs}
+viewof reset2 = resetButton(viewof disag2, viewof valtype2)
+```
+
+## Row {.flow}
+
+```{ojs}
+grid2 = renderPage(2, disag2, valtype2, invalidation)
+```
+
+# Досвід участі
+
+## {.sidebar}
+
+```{ojs}
+viewof disag3 = breakdownSelect(3)
+```
+
+```{ojs}
+viewof valtype3 = valueRadio(3)
+```
+
+```{ojs}
+viewof reset3 = resetButton(viewof disag3, viewof valtype3)
+```
+
+## Row {.flow}
+
+```{ojs}
+grid3 = renderPage(3, disag3, valtype3, invalidation)
+```
+
+# Роль адміністрації
+
+## {.sidebar}
+
+```{ojs}
+viewof disag4 = breakdownSelect(4)
+```
+
+```{ojs}
+viewof valtype4 = valueRadio(4)
+```
+
+```{ojs}
+viewof reset4 = resetButton(viewof disag4, viewof valtype4)
+```
+
+## Row {.flow}
+
+```{ojs}
+grid4 = renderPage(4, disag4, valtype4, invalidation)
+```
+
+# Порівняння адміністрації та вчителів
+
+## {.sidebar}
+
+```{r}
+#| include: false
+# ---- page 5: the two population groups side by side ---------------------------
+# Every frequency table in clean_df_harmonized.parquet is split by h_population
+# (manager = heads + deputy heads, teacher). Option/category labels in that file
+# are English; the Ukrainian ones come from the harmonised KoBo form (`choices`),
+# which also says which group each option was asked of (`available_to`).
+h <- read_parquet("inputs/dashboard_data/clean_df_harmonized.parquet",
+  col_select = c("admin", "admin_category", "admin_category_orig", "option", "option_orig",
+                 "variable", "variable_orig", "perc", "general_count", "disaggregations_category_1_orig"))
+hk_path <- "inputs/supervision_survey_educators_2_harmonised.xlsx"
+hk_survey  <- read.xlsx(hk_path, sheet = "survey")
+hk_choices <- read.xlsx(hk_path, sheet = "choices")
+hk_choices$label_uk <- decode_entities(hk_choices[[grep("^label::Ukrainian", names(hk_choices))[1]]])
+hk_multi <- hk_survey$name[grepl("^select_multiple", hk_survey$type)]
+
+cmp_groups <- hk_choices %>% filter(list_name == "h_population") %>%
+  transmute(code = name, label = label_uk) %>% arrange(match(code, c("manager", "teacher")))
+exp_lab <- hk_choices %>% filter(list_name == "h_experience") %>% transmute(code = name, label = label_uk)
+
+s5  <- sheet[vapply(sheet$pages, function(p) cmp_page %in% page_of(p), logical(1)), ]
+min_n <- as.numeric(spec_of(cmp_page)$min_n)
+cmp_breakdowns <- setdiff(strsplit(spec_of(cmp_page)$breakdowns, ";")[[1]], "Overall")
+dyn <- s5$name[s5$Graph_type == "dynamic"]
+stopifnot(setequal(s5$name, c("h_population", "h_oblast", "h_experience", dyn)))
+
+# Who answered what differs between the groups - say so under the card.
+cmp_notes <- c(
+  h_barriers      = "Вчителі: лише ті, хто не брав участі. Керівники: усі.",
+  h_informed      = "Вчителі відповідали про себе, керівники — про свій колектив.",
+  h_sought        = "Вчителі відповідали про себе (брали участь або намагалися замовити), керівники — про свій колектив.",
+  h_admin_informs = "Керівники: лише ті, у чиїх закладах супервізію організовують."
+)
+# Card order, orientation, layout and "hidden under a breakdown" all come from the sheet.
+cmp_cfg <- tibble(code = s5$name, pos = s5$Card_order, g = s5$Page_gen_type_graph,
+                  layout_hint = coalesce(s5$Layout_hint, "auto"),
+                  vertical = coalesce(s5$Orientation_overall == "vertical", FALSE),
+                  static = s5$Hidden_when_breakdown == "yes") %>%
+  mutate(
+    kind  = case_when(code == "h_population" ~ "pop", code %in% c("h_oblast", "h_experience") ~ "comp",
+                      code %in% hk_multi ~ "multi", TRUE ~ "single"),
+    label = vapply(code, function(cd) h$variable[h$variable_orig == cd][1], character(1)),
+    note  = coalesce(unname(cmp_notes[code]), "")
+  ) %>% arrange(pos)
+if (anyNA(cmp_cfg$pos) || anyDuplicated(cmp_cfg$pos))
+  stop("sheet_classification.xlsx: Card_order must be filled and unique on the comparison page", call. = FALSE)
+# the comparison page can only draw one chart per kind of card - say so instead of ignoring the sheet
+want <- c(pop = "donut", comp = "stacked_bar", multi = "grouped_bar", single = "stacked_bar")
+bad  <- cmp_cfg$code[cmp_cfg$g != want[cmp_cfg$kind]]
+if (length(bad)) stop("sheet_classification.xlsx: the comparison page cannot draw the chart the sheet asks for: ",
+                      paste(bad, collapse = ", "), call. = FALSE)
+
+# ---- options of the comparison questions (Ukrainian labels, order, colours) ----
+cmp_order <- list(h_informed = c("informed", "partly", "not_informed"),
+                  h_sought = c("yes", "no", "dont_know"), h_admin_informs = c("yes", "no"))
+cmp_opts <- bind_rows(lapply(dyn, function(cd) {
+  ch <- hk_choices %>% filter(list_name == cd) %>%
+    transmute(code = cd, option_orig = name, option = label_uk, avail = available_to)
+  mx <- h %>% filter(variable_orig == cd, admin == "Overall") %>%
+    group_by(option_orig) %>% summarise(mx = max(perc), .groups = "drop")
+  ch <- ch %>% left_join(mx, by = "option_orig") %>%
+    mutate(mx = coalesce(mx, 0), neutral = option_orig %in% neutral_opts)
+  ch <- if (!is.null(cmp_order[[cd]])) ch %>% arrange(match(option_orig, cmp_order[[cd]])) else
+    ch %>% arrange(neutral, desc(mx))      # multi-select: by the larger of the two shares
+  n <- sum(!ch$neutral)
+  cols <- if (n == 0) character(0) else if (n <= 5) ramps[[as.character(n)]] else
+    colorRampPalette(c("#143a6b", "#bcd6ef"))(n)
+  ch$color <- neutral_color
+  ch$color[!ch$neutral] <- cols
+  ch$rank <- seq_len(nrow(ch))
+  ch %>% select(code, option_orig, option, rank, color, avail)
+}))
+
+# ---- comparison rows: (question, breakdown, category, group, option) ----------
+dr <- h %>%
+  filter(variable_orig %in% dyn, admin %in% c("Overall", cmp_breakdowns)) %>%
+  transmute(variable_orig, admin, population = disaggregations_category_1_orig, option_orig, perc,
+            base = general_count,
+            category = case_when(admin == "Overall" ~ "Overall",
+                                 admin == "h_experience" ~ exp_lab$label[match(admin_category_orig, exp_lab$code)],
+                                 TRUE ~ admin_category))
+cells <- dr %>% distinct(variable_orig, admin, category, population, base) %>%
+  complete(nesting(variable_orig, admin, category), population = c("manager", "teacher"),
+           fill = list(base = 0))
+# a category stays if at least ONE group has min_n respondents; the other
+# group's cells are blanked in the browser (base < min_n)
+keep <- cells %>% filter(admin != "Overall") %>%
+  group_by(variable_orig, admin, category) %>% summarise(ok = any(base >= min_n), .groups = "drop")
+cmp_dropped <- keep %>% group_by(variable_orig, admin) %>%
+  summarise(n_dropped = sum(!ok), n_total = n(), .groups = "drop")
+
+cmp_rows <- cells %>%
+  left_join(keep, by = c("variable_orig", "admin", "category")) %>%
+  filter(admin == "Overall" | ok) %>%
+  inner_join(cmp_opts %>% select(variable_orig = code, option_orig, avail),
+             by = "variable_orig", relationship = "many-to-many") %>%
+  # only options this group was asked: "not asked" must not become a 0 %
+  filter(avail == "both" | (avail == "teachers_only" & population == "teacher") |
+           (avail == "managers_only" & population == "manager")) %>%
+  left_join(dr %>% select(variable_orig, admin, category, population, option_orig, perc),
+            by = c("variable_orig", "admin", "category", "population", "option_orig")) %>%
+  mutate(perc = coalesce(perc, 0), count = round(perc * base)) %>%
+  select(variable_orig, admin, category, population, option_orig, perc, count, base)
+
+# ---- static composition of the sample (h_population, h_oblast, h_experience) ----
+comp_src <- h %>%
+  filter(variable_orig %in% c("h_population", "h_oblast", "h_experience")) %>%
+  transmute(code = variable_orig,
+            population = if_else(variable_orig == "h_population", option_orig, disaggregations_category_1_orig),
+            category = case_when(variable_orig == "h_population" ~ "Усі",
+                                 variable_orig == "h_experience" ~ exp_lab$label[match(option_orig, exp_lab$code)],
+                                 TRUE ~ option),
+            perc, base = general_count, count = round(perc * general_count)) %>%
+  complete(nesting(code, category), population = c("manager", "teacher"),
+           fill = list(perc = 0, count = 0)) %>%
+  group_by(code, population) %>% mutate(base = max(base, na.rm = TRUE)) %>% ungroup()
+tot <- comp_src %>% filter(code != "h_population") %>%
+  group_by(code, category) %>% summarise(total = sum(count), .groups = "drop")
+cmp_dropped <- bind_rows(cmp_dropped,
+  tot %>% group_by(variable_orig = code) %>%
+    summarise(admin = "static", n_dropped = sum(total < min_n), n_total = n(), .groups = "drop"))
+cmp_comp <- comp_src %>% left_join(tot, by = c("code", "category")) %>%
+  filter(code == "h_population" | total >= min_n) %>% select(-total)
+
+ojs_define(cmp_cfg = cmp_cfg, cmp_opts = cmp_opts, cmp_rows = cmp_rows, cmp_comp = cmp_comp,
+           cmp_dropped = cmp_dropped, cmp_groups = cmp_groups)
+```
+
+```{ojs}
+//| output: false
+ccfgs = transpose(cmp_cfg)
+copts = transpose(cmp_opts)
+crows = transpose(cmp_rows)
+ccomp = transpose(cmp_comp)
+cdropped = transpose(cmp_dropped)
+cgroups = transpose(cmp_groups)
+```
+
+```{ojs}
+//| output: false
+// Page 5: every card compares the two groups (managers vs teachers).
+//  pop    donut of the two groups              (static: ignores the breakdown)
+//  comp   100% stacked bar per oblast/experience group: managers vs teachers
+//         among that category's respondents   (static)
+//  single overall: one 100% stacked bar per group; breakdown: two heatmaps
+//  multi  overall: grouped bars (a pair per option, NOT stacked: shares sum
+//         above 100 %); breakdown: two heatmaps
+renderComparePage = function(disag, valtype, invalidation) {
+  const {TXT, wrap, titleOf, isLight, mountGrid, sortCats} = gridKit;
+  const CM = "#143a6b", CT = "#6fa5d8";
+  const POPS = ["manager", "teacher"];
+  const COL = {manager: CM, teacher: CT};
+  const glabel = new Map(cgroups.map(d => [d.code, d.label]));
+  const bkOf = code => bks.find(b => b.code === code) || {};
+  const NOUN = new Proxy({}, {get: (_, k) => bkOf(k).noun_uk});             // from the breakdowns sheet
+  const BY = new Proxy({}, {get: (_, k) => bkOf(k).title_suffix_uk});
+  const MULTI_NOTE = "Можна обрати кілька варіантів";
+  const MIN_N = +pspecs.find(p => +p.page === 5).min_n;                     // from the main sheet
+  const isCount = valtype === "count";
+  const key = isCount ? "count" : "perc";
+  const fmt = isCount ? ",d" : ".0%";
+  const overall = disag === "Overall";
+  const num = x => Number(x).toLocaleString("uk-UA");
+  const asked = (avail, p) => avail === "both" || (avail === "teachers_only" && p === "teacher")
+    || (avail === "managers_only" && p === "manager");
+  const yAxis = (wide, slots) => ({
+    ...(wide ? {autorange: "reversed"} : {range: [slots - 0.5, -0.5]}),
+    type: "category", automargin: true, showgrid: false, zeroline: false, tickfont: {size: 11}});
+  const only = avail => avail === "teachers_only" ? "<br><i>(лише вчителям)</i>"
+    : avail === "managers_only" ? "<br><i>(лише керівникам)</i>" : "";
+
+  // page-wide metrics so cards in a row keep aligned axes
+  const topPx = 36 + 17 * (Math.max(1, ...ccfgs.map(c =>
+    wrap(`${c.label} (за стажем роботи): співвідношення керівників і вчителів`, 60).split("<br>").length)) + 1);
+  const groupedLines = Math.max(1, ...copts.filter(d => ccfgs.find(c => c.code === d.code).kind === "multi")
+    .map(d => (wrap(d.option, 30) + only(d.avail)).split("<br>").length));
+  const gPx = Math.max(48, 14 * groupedLines + 18);   // px per option in the grouped bars
+
+  const dropNote = (code, adm, what) => {
+    const d = cdropped.find(x => x.variable_orig === code && x.admin === adm && x.n_dropped > 0);
+    return d ? `Не показано ${d.n_dropped} з ${d.n_total} ${NOUN[code] || NOUN[adm]}: ${what}.` : "";
+  };
+
+  const makeCard = c => {
+    let wide = false, slots = 0, plots = 1, kind = c.kind, noteLines = [];
+    let parts = [];
+    const overallRows = crows.filter(d => d.variable_orig === c.code && d.admin === "Overall");
+    const baseOfGroup = p => (overallRows.find(d => d.population === p) || {base: 0}).base;
+    const sub = extra => [`Відповіли: керівники ${num(baseOfGroup("manager"))} · вчителі ${num(baseOfGroup("teacher"))}`, extra]
+      .filter(Boolean).join(" · ");
+    let emptyText = null, titleNote = null;
+
+    if (c.kind === "pop") {
+      const rs = ccomp.filter(d => d.code === c.code);
+      const total = rs.reduce((s, d) => s + d.count, 0);
+      const get = (p, k) => rs.find(d => d.population === p)[k];
+      parts = [{build: () => ({height: 360, traces: [{
+          type: "pie", hole: 0.55, sort: false, direction: "clockwise",
+          labels: POPS.map(p => wrap(glabel.get(p), 14)),
+          values: POPS.map(p => get(p, key)), customdata: POPS.map(p => get(p, "count")),
+          marker: {colors: [CM, CT]}, textposition: "outside",
+          texttemplate: isCount ? "%{value:,d}" : "%{percent:.1%}",
+          hovertemplate: "%{label}<br>%{percent:.1%} (n = %{customdata})<extra></extra>",
+          domain: {x: [0.04, 0.5], y: [0.08, 0.92]}}],
+        layout: {title: titleOf(c.label, `Відповіли ${num(total)}`, 60), showlegend: true,
+          legend: {orientation: "v", x: 0.54, xanchor: "left", y: 0.5, font: {size: 11}},
+          margin: {l: 20, r: 20, t: topPx, b: 20}}})}];
+    } else if (c.kind === "comp") {
+      const rs = ccomp.filter(d => d.code === c.code);
+      const cats = [...new Set(rs.map(d => d.category))];
+      const cnt = (k, p) => rs.find(d => d.category === k && d.population === p).count;
+      const tot = k => cnt(k, "manager") + cnt(k, "teacher");
+      sortCats(cats, bkOf(c.code), tot);
+      const totalAll = ccomp.filter(d => d.code === "h_population").reduce((s, d) => s + d.count, 0);
+      const maxTot = Math.max(...cats.map(tot));
+      wide = cats.length > 8; slots = c.vertical ? 0 : cats.length;
+      noteLines.push(dropNote(c.code, "static", "менше ніж 30 респондентів"));
+      if (c.vertical) {
+        // 100% stacked columns that stretch to the height of the row
+        const labs = cats.map(k => `${wrap(k, 14)}<br>(n = ${tot(k)})`);
+        const lines = Math.max(...labs.map(t => t.split("<br>").length));
+        parts = [{fill: true, build: (sl, fillH) => ({height: Math.max(topPx + 236 + 14 * lines, fillH || 0),
+          traces: POPS.map(p => ({
+            type: "bar", orientation: "v", name: glabel.get(p),
+            x: labs, y: cats.map(k => isCount ? cnt(k, p) : (tot(k) ? cnt(k, p) / tot(k) : 0)),
+            marker: {color: COL[p], line: {color: "#ffffff", width: 1}},
+            customdata: cats.map(k => cnt(k, p)),
+            text: cats.map(k => {
+              const share = tot(k) ? cnt(k, p) / tot(k) : 0;
+              const big = isCount ? cnt(k, p) >= 0.07 * maxTot : share >= 0.07;
+              return big ? (isCount ? String(cnt(k, p)) : (share * 100).toFixed(0) + "%") : "";
+            }),
+            textposition: "inside", insidetextanchor: "middle", textangle: 0,
+            textfont: {color: isLight(COL[p]) ? TXT : "#ffffff", size: 11},
+            hovertemplate: `%{x}<br>${glabel.get(p)}: %{y:${fmt}} (n = %{customdata})<extra></extra>`})),
+          layout: {title: titleOf(`${c.label}: співвідношення керівників і вчителів`, `Відповіли ${num(totalAll)}`, 60),
+            barmode: "stack", margin: {l: 55, r: 20, t: topPx + 26, b: 20},
+            xaxis: {type: "category", automargin: true, showgrid: false, tickfont: {size: 11}, tickangle: 0},
+            yaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+            legend: {orientation: "h", x: 0, xanchor: "left", y: 1.01, yanchor: "bottom", traceorder: "normal", font: {size: 11}}}})}];
+      } else parts = [{build: sl => ({height: topPx + 80 + 30 * sl,
+        traces: POPS.map(p => ({
+          type: "bar", orientation: "h", name: glabel.get(p),
+          x: cats.map(k => isCount ? cnt(k, p) : (tot(k) ? cnt(k, p) / tot(k) : 0)),
+          y: cats.map(k => `${k} (n = ${tot(k)})`),
+          marker: {color: COL[p], line: {color: "#ffffff", width: 1}},
+          customdata: cats.map(k => cnt(k, p)),
+          text: cats.map(k => {
+            const share = tot(k) ? cnt(k, p) / tot(k) : 0;
+            const big = isCount ? cnt(k, p) >= 0.07 * maxTot : share >= 0.07;
+            return big ? (isCount ? String(cnt(k, p)) : (share * 100).toFixed(0) + "%") : "";
+          }),
+          textposition: "inside", insidetextanchor: "middle", textangle: 0,
+          textfont: {color: isLight(COL[p]) ? TXT : "#ffffff", size: 11},
+          hovertemplate: `%{y}<br>${glabel.get(p)}: %{x:${fmt}} (n = %{customdata})<extra></extra>`})),
+        layout: {title: titleOf(`${c.label}: співвідношення керівників і вчителів`, `Відповіли ${num(totalAll)}`, wide ? 120 : 60),
+          barmode: "stack", margin: {l: 185, r: 190, t: topPx, b: 40},
+          xaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+          yaxis: yAxis(wide, sl),
+          legend: {orientation: "v", x: 1.01, xanchor: "left", y: 1, yanchor: "top", traceorder: "normal", font: {size: 11}}}})}];
+    } else {
+      const o = copts.filter(d => d.code === c.code).sort((a, b) => a.rank - b.rank);
+      const multi = c.kind === "multi";
+      const note = multi ? MULTI_NOTE : null;
+      const rs = crows.filter(d => d.variable_orig === c.code && d.admin === disag);
+      if (c.note) noteLines.push(c.note);
+      const val = (cat, p, opt, k = key) => {
+        const r = rs.find(d => d.category === cat && d.population === p && d.option_orig === opt);
+        return r ? r[k] : null;
+      };
+      const baseOf = (cat, p) => { const r = rs.find(d => d.category === cat && d.population === p); return r ? r.base : 0; };
+
+      if (overall) {
+        const oc = rs[0] ? rs[0].category : null;
+        if (!multi) {
+          // one 100% stacked bar per group (columns that fill the row when `vertical`)
+          slots = c.vertical ? 0 : 2;
+          if (c.vertical) parts = [{fill: true, build: (sl, fillH) => ({height: Math.max(topPx + 276, fillH || 0),
+            traces: o.map(d => ({
+              type: "bar", orientation: "v", name: wrap(d.option, 20),
+              x: POPS.map(p => `${wrap(glabel.get(p), 16)}<br>(n = ${baseOfGroup(p)})`),
+              y: POPS.map(p => val(oc, p, d.option_orig)),
+              marker: {color: d.color, line: {color: "#ffffff", width: 1}},
+              customdata: POPS.map(p => val(oc, p, d.option_orig, "count")),
+              text: POPS.map(p => val(oc, p, d.option_orig, "perc") >= 0.07
+                ? (isCount ? String(val(oc, p, d.option_orig, "count")) : (val(oc, p, d.option_orig, "perc") * 100).toFixed(0) + "%") : ""),
+              textposition: "inside", insidetextanchor: "middle", textangle: 0,
+              textfont: {color: isLight(d.color) ? TXT : "#ffffff", size: 11},
+              hovertemplate: `%{x}<br>${d.option}: %{y:${fmt}} (n = %{customdata})<extra></extra>`})),
+            layout: {title: titleOf(c.label, sub(note), 60), barmode: "stack",
+              margin: {l: 55, r: 20, t: topPx + 26, b: 20},
+              xaxis: {type: "category", automargin: true, showgrid: false, tickfont: {size: 11}, tickangle: 0},
+              yaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+              legend: {orientation: "h", x: 0, xanchor: "left", y: 1.01, yanchor: "bottom", traceorder: "normal", font: {size: 11}}}})}];
+          else parts = [{build: sl => ({height: topPx + 80 + 30 * sl,
+            traces: o.map(d => ({
+              type: "bar", orientation: "h", name: wrap(d.option, 20),
+              x: POPS.map(p => val(oc, p, d.option_orig)), y: POPS.map(p => `${wrap(glabel.get(p), 24)}<br>(n = ${baseOfGroup(p)})`),
+              marker: {color: d.color, line: {color: "#ffffff", width: 1}},
+              customdata: POPS.map(p => val(oc, p, d.option_orig, "count")),
+              text: POPS.map(p => val(oc, p, d.option_orig, "perc") >= 0.07
+                ? (isCount ? String(val(oc, p, d.option_orig, "count")) : (val(oc, p, d.option_orig, "perc") * 100).toFixed(0) + "%") : ""),
+              textposition: "inside", insidetextanchor: "middle", textangle: 0,
+              textfont: {color: isLight(d.color) ? TXT : "#ffffff", size: 11},
+              hovertemplate: `%{y}<br>${d.option}: %{x:${fmt}} (n = %{customdata})<extra></extra>`})),
+            layout: {title: titleOf(c.label, sub(note), 60), barmode: "stack",
+              margin: {l: 185, r: 190, t: topPx, b: 40},
+              xaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+              yaxis: yAxis(false, sl),
+              legend: {orientation: "v", x: 1.01, xanchor: "left", y: 1, yanchor: "top", traceorder: "normal", font: {size: 11}}}})}];
+        } else {
+          // grouped bars: a pair per option; "not asked" = no bar
+          slots = o.length;
+          parts = [{build: sl => ({height: topPx + 60 + gPx * sl,
+            traces: POPS.map(p => ({
+              type: "bar", orientation: "h", name: glabel.get(p), marker: {color: COL[p]},
+              x: o.map(d => asked(d.avail, p) ? val(oc, p, d.option_orig) : null),
+              y: o.map(d => wrap(d.option, 30) + only(d.avail)),
+              customdata: o.map(d => asked(d.avail, p) ? val(oc, p, d.option_orig, "count") : null),
+              texttemplate: `%{x:${fmt}}`, textposition: "outside", cliponaxis: false,
+              hovertemplate: `%{y}<br>${glabel.get(p)}: %{x:${fmt}} (n = %{customdata})<extra></extra>`})),
+            layout: {title: titleOf(c.label, sub(note), 60), barmode: "group", margin: {l: 200, r: 60, t: topPx, b: 40},
+              xaxis: {tickformat: fmt, showgrid: false, zeroline: false, range: isCount ? null : [0, 1]},
+              yaxis: yAxis(false, sl),
+              legend: {x: 1, xanchor: "right", y: 0.04, yanchor: "bottom", font: {size: 11}}}})}];
+        }
+      } else {
+        // breakdown: two heatmaps (managers above, teachers below), same colour scale
+        const cats = [...new Set(rs.map(d => d.category))];
+        const total = k => baseOf(k, "manager") + baseOf(k, "teacher");
+        sortCats(cats, bkOf(disag), total);
+        if (cats.length < 2) emptyText = `Недостатньо даних для порівняння: менше двох ${NOUN[disag]} мають щонайменше ${MIN_N} респондентів хоча б в одній групі.`;
+        else {
+          wide = true; plots = 2;
+          const shown = (k, p) => baseOf(k, p) >= MIN_N;
+          const cell = (k, p, d) => (shown(k, p) && asked(d.avail, p)) ? val(k, p, d.option_orig) : null;
+          const cellN = (k, p, d) => (shown(k, p) && asked(d.avail, p)) ? val(k, p, d.option_orig, "count") : null;
+          const availRank = a => a === "both" ? 0 : a === "managers_only" ? 1 : 2;
+          const oh = [...o].sort((a, b) => availRank(a.avail) - availRank(b.avail) || a.rank - b.rank);
+          const zmax = isCount ? Math.max(1, ...cats.flatMap(k => POPS.flatMap(p => oh.map(d => cell(k, p, d) || 0)))) : 1;
+          noteLines.push(dropNote(c.code, disag, "у жодній із груп немає 30 респондентів"));
+          noteLines.push("Порожні клітинки: група не відповідала на цей варіант або в категорії менше ніж 30 респондентів цієї групи.");
+          const subTitle = text => ({text, font: {size: 12, color: TXT}, x: 0.01, xanchor: "left", y: 1,
+            yanchor: "top", yref: "container", pad: {t: 6}, automargin: true});
+          parts = POPS.map((p, idx) => {
+            // drop rows/columns that are empty for THIS group (not asked, or < MIN_N respondents),
+            // and say how many were left out
+            const rowsP = cats.filter(k => oh.some(d => cell(k, p, d) !== null));
+            const colsP = oh.filter(d => cats.some(k => cell(k, p, d) !== null));
+            const hr = cats.length - rowsP.length, hc = oh.length - colsP.length;
+            const comment = (hr || hc)
+              ? `${p === "manager" ? "Керівники" : "Вчителі"}: не показано ${hr} з ${cats.length} рядків і ${hc} з ${oh.length} стовпців через відсутність даних для цієї категорії` : "";
+            const many = colsP.length > 12;
+            const xl = colsP.map(d => wrap(d.option, many ? 9 : colsP.length > 8 ? 12 : 16));
+            const labLines = xl.length ? Math.max(...xl.map(t => t.split("<br>").length)) : 1;
+            // the shared (first) title is larger and underlined so both heatmaps read as one topic
+            const bigLines = wrap(`${c.label} (${BY[disag]})`, 95).split("<br>");
+            const titleLines = bigLines.length * 1.25 + 1 + (comment ? 1 : 0);
+            const top = idx === 0 ? 46 + titleLines * 18 + labLines * 14 : 24 + (comment ? 18 : 0) + labLines * 14;
+            const title = idx === 0
+              ? {...titleOf("", "", 95),
+                 text: bigLines.map(l => `<span style="text-decoration:underline">${l}</span>`).join("<br>")
+                   + `<br><span style="font-size:12px;font-weight:normal;text-decoration:none">${sub(note)}${comment ? `<br>${comment}` : ""}</span>`,
+                 font: {size: 18, color: TXT}}
+              : (comment ? subTitle(comment) : undefined);
+            const ytitle = {text: wrap(glabel.get(p), 18), font: {size: 12}, standoff: 22};
+            if (!rowsP.length || !colsP.length) {
+              // nothing to show for this group at all
+              return {build: () => ({height: top + 70, traces: [],
+                layout: {...(title ? {title} : {}), margin: {l: 215, r: 10, t: top - labLines * 14 + 10, b: 10},
+                  xaxis: {visible: false}, yaxis: {visible: false, title: ytitle},
+                  annotations: [{text: "Немає даних для цієї групи", showarrow: false, xref: "paper", yref: "paper",
+                    x: 0, y: 0.5, xanchor: "left", font: {size: 12, color: TXT}}]}})};
+            }
+            return {build: () => ({height: top + 26 * rowsP.length + 50,
+              traces: [{type: "heatmap", x: xl, y: rowsP.map(k => `${k} (n = ${baseOf(k, p)})`),
+                z: rowsP.map(k => colsP.map(d => cell(k, p, d))),
+                customdata: rowsP.map(k => colsP.map(d => cellN(k, p, d))),
+                colorscale: [[0, "#e8f1fa"], [0.5, "#6fa5d8"], [1, "#143a6b"]],
+                zmin: 0, zmax, xgap: 2, ygap: 2, hoverongaps: false,
+                texttemplate: isCount ? "%{z:,d}" : "%{z:.0%}", showscale: idx === 0,
+                colorbar: {tickformat: fmt, thickness: 12, len: 0.9},
+                hovertemplate: `%{y}<br>%{x}<br>${glabel.get(p)}: %{z:${fmt}} (n = %{customdata})<extra></extra>`}],
+              layout: {...(title ? {title} : {}),
+                margin: {l: 215, r: 10, t: top, b: 10},
+                xaxis: {type: "category", side: "top", automargin: true, showgrid: false, tickfont: {size: many ? 10 : 11}, tickangle: 0},
+                yaxis: {type: "category", autorange: "reversed", automargin: true, showgrid: false, tickfont: {size: 11},
+                        title: ytitle}}})};
+          });
+        }
+      }
+    }
+
+    const foot = noteLines.filter(Boolean).map(t => `<div class="p1-note">${t}</div>`).join("");
+    const inner = emptyText
+      ? `<div class="p1-empty">${c.label}<br><em>${emptyText}</em></div>`
+      : Array.from({length: plots}, () => `<div class="p1-plot"></div>`).join("");
+    const el = html`<div class="p1-card${wide ? " wide" : ""}"></div>`;
+    el.innerHTML = inner + foot;
+    const divs = [...el.querySelectorAll(".p1-plot")];
+    parts.forEach((p, i) => { p.plot = divs[i]; });
+    return {el, wide, slots, useSlots: slots, parts, hint: c.layout_hint};
+  };
+
+  // static composition cards only make sense for the overall view
+  const cards = ccfgs.filter(c => overall || !c.static).sort((a, b) => a.pos - b.pos).map(makeCard);
+  return mountGrid(cards, invalidation);
+}
+```
+
+```{ojs}
+viewof disag5 = breakdownSelect(5)
+```
+
+```{ojs}
+viewof valtype5 = valueRadio(5)
+```
+
+```{ojs}
+viewof reset5 = resetButton(viewof disag5, viewof valtype5)
+```
+
+## Row {.flow}
+
+```{ojs}
+grid5 = renderComparePage(disag5, valtype5, invalidation)
+```
+
+# Методологія
+
+## Row {.tabset}
+
+### Збір даних
+
+{{< include text_findings/methodology_collection.md >}}
+
+### Обробка та аналіз
+
+{{< include text_findings/methodology_processing.md >}}
+
+### Обмеження та тлумачення
+
+{{< include text_findings/methodology_limitations.md >}}
